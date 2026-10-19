@@ -635,8 +635,6 @@ fn verified_billing_identity_ignores_forged_org_and_cost_center() {
 
     let mut ctx = make_filter_context(&req);
     ctx.filter_metadata
-        .insert("x-tenant-username".to_owned(), "alice".to_owned());
-    ctx.filter_metadata
         .insert("x-tenant-organization-id".to_owned(), "org-verified".to_owned());
     ctx.filter_metadata
         .insert("x-tenant-cost-center".to_owned(), "cc-verified".to_owned());

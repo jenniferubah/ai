@@ -126,6 +126,9 @@ const STATUS_METERING_UNAVAILABLE: u16 = 503;
 /// headers. A higher tier always wins, so forged client headers can
 /// never override verified claims, and identity headers plus client
 /// credentials are always stripped before the request is forwarded.
+/// Both event types carry `data.organization_id` and `data.cost_center`
+/// from `{prefix}organization-id` and `{prefix}cost-center`. When absent,
+/// those fields are empty strings rather than invented defaults.
 ///
 /// When no `{prefix}model` identity header names the model and
 /// `model_to_provider` mapped the request, balance checks and usage events use
