@@ -26,6 +26,18 @@ fn external_metering_config_parses() {
     assert_eq!(config.listeners.len(), 1, "should have 1 listener");
 }
 
+#[test]
+fn external_metering_kafka_config_parses() {
+    let metering_port = free_port();
+    let config = super::load_example_config(
+        "external-metering-kafka.yaml",
+        29810,
+        HashMap::from([("127.0.0.1:3000", 29811_u16), ("127.0.0.1:9090", metering_port)]),
+    );
+
+    assert_eq!(config.listeners.len(), 1, "should have 1 listener");
+}
+
 // -----------------------------------------------------------------------------
 // Balance Check — Access Granted
 // -----------------------------------------------------------------------------

@@ -345,6 +345,230 @@ unknown_field: true
     assert!(result.is_err());
 }
 
+#[cfg(not(feature = "metering-kafka"))]
+#[test]
+fn kafka_config_requires_metering_kafka_feature() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+metering_url: "http://metering:8080"
+kafka:
+  brokers: ["kafka:9093"]
+  topic: metering.events
+  tls:
+    enabled: false
+  sasl:
+    mechanism: SCRAM-SHA-512
+    username: metering
+    password:
+      file: /nonexistent/kafka-password
+"#,
+    )
+    .unwrap();
+    let Err(err) = ExternalMeteringFilter::from_config(&yaml) else {
+        panic!("kafka config without metering-kafka feature must fail construction");
+    };
+    assert!(
+        err.to_string().contains("metering-kafka"),
+        "error should name the feature: {err}"
+    );
+}
+
+#[cfg(feature = "metering-kafka")]
+mod kafka_config {
+    use std::io::Write;
+
+    use super::*;
+    use crate::metering::config::{
+        KAFKA_SASL_SCRAM_SHA_512, join_kafka_brokers, kafka_security_protocol, validate_kafka_brokers,
+    };
+
+    fn kafka_yaml(password_file: &str) -> serde_yaml::Value {
+        serde_yaml::from_str(&format!(
+            r#"
+metering_url: "http://metering:8080"
+kafka:
+  brokers: ["kafka:9093"]
+  topic: metering.events
+  tls:
+    enabled: false
+  sasl:
+    mechanism: SCRAM-SHA-512
+    username: metering
+    password:
+      file: {password_file}
+"#
+        ))
+        .unwrap()
+    }
+
+    fn write_temp_file(dir: &tempfile::TempDir, name: &str, contents: &[u8]) -> String {
+        let path = dir.path().join(name);
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(contents).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn security_protocol_follows_tls_flag() {
+        assert_eq!(kafka_security_protocol(true), "SASL_SSL");
+        assert_eq!(kafka_security_protocol(false), "SASL_PLAINTEXT");
+    }
+
+    #[test]
+    fn brokers_validate_and_join() {
+        assert!(validate_kafka_brokers(&[]).is_err());
+        assert!(validate_kafka_brokers(&[String::new()]).is_err());
+        assert!(validate_kafka_brokers(&[String::from("kafka:9093")]).is_ok());
+        assert_eq!(
+            join_kafka_brokers(&[String::from("a:1"), String::from("b:2")]),
+            "a:1,b:2"
+        );
+    }
+
+    #[test]
+    fn scram_constant_is_stable() {
+        assert_eq!(KAFKA_SASL_SCRAM_SHA_512, "SCRAM-SHA-512");
+    }
+
+    #[test]
+    fn accepts_valid_kafka_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let password = write_temp_file(&dir, "password", b"secret");
+        let yaml = kafka_yaml(&password);
+        ExternalMeteringFilter::from_config(&yaml).expect("valid kafka config must construct");
+    }
+
+    #[test]
+    fn rejects_empty_topic() {
+        let dir = tempfile::tempdir().unwrap();
+        let password = write_temp_file(&dir, "password", b"secret");
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+            r#"
+metering_url: "http://metering:8080"
+kafka:
+  brokers: ["kafka:9093"]
+  topic: "   "
+  tls:
+    enabled: false
+  sasl:
+    mechanism: SCRAM-SHA-512
+    username: metering
+    password:
+      file: {password}
+"#
+        ))
+        .unwrap();
+        let err = ExternalMeteringFilter::from_config(&yaml).unwrap_err();
+        assert!(err.to_string().contains("kafka.topic"), "{err}");
+    }
+
+    #[test]
+    fn rejects_non_scram_mechanism() {
+        let dir = tempfile::tempdir().unwrap();
+        let password = write_temp_file(&dir, "password", b"secret");
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+            r#"
+metering_url: "http://metering:8080"
+kafka:
+  brokers: ["kafka:9093"]
+  topic: metering.events
+  tls:
+    enabled: false
+  sasl:
+    mechanism: PLAIN
+    username: metering
+    password:
+      file: {password}
+"#
+        ))
+        .unwrap();
+        let err = ExternalMeteringFilter::from_config(&yaml).unwrap_err();
+        assert!(err.to_string().contains("SCRAM-SHA-512"), "{err}");
+    }
+
+    #[test]
+    fn rejects_inline_password() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+metering_url: "http://metering:8080"
+kafka:
+  brokers: ["kafka:9093"]
+  topic: metering.events
+  tls:
+    enabled: false
+  sasl:
+    mechanism: SCRAM-SHA-512
+    username: metering
+    password:
+      value: inline-secret
+"#,
+        )
+        .unwrap();
+        let err = ExternalMeteringFilter::from_config(&yaml).unwrap_err();
+        assert!(err.to_string().contains("file:"), "{err}");
+    }
+
+    #[test]
+    fn rejects_missing_password_file() {
+        let yaml = kafka_yaml("/nonexistent/kafka-password");
+        let err = ExternalMeteringFilter::from_config(&yaml).unwrap_err();
+        assert!(err.to_string().contains("kafka.sasl.password"), "{err}");
+    }
+
+    #[test]
+    fn rejects_tls_without_ca_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let password = write_temp_file(&dir, "password", b"secret");
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+            r#"
+metering_url: "http://metering:8080"
+kafka:
+  brokers: ["kafka:9093"]
+  topic: metering.events
+  tls:
+    enabled: true
+  sasl:
+    mechanism: SCRAM-SHA-512
+    username: metering
+    password:
+      file: {password}
+"#
+        ))
+        .unwrap();
+        let err = ExternalMeteringFilter::from_config(&yaml).unwrap_err();
+        assert!(err.to_string().contains("kafka.tls.ca_file"), "{err}");
+    }
+
+    #[test]
+    fn accepts_tls_with_ca_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let password = write_temp_file(&dir, "password", b"secret");
+        let ca = write_temp_file(
+            &dir,
+            "ca.pem",
+            b"-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n",
+        );
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+            r#"
+metering_url: "http://metering:8080"
+kafka:
+  brokers: ["kafka:9093"]
+  topic: metering.events
+  tls:
+    enabled: true
+    ca_file: {ca}
+  sasl:
+    mechanism: SCRAM-SHA-512
+    username: metering
+    password:
+      file: {password}
+"#
+        ))
+        .unwrap();
+        ExternalMeteringFilter::from_config(&yaml).expect("tls + ca_file must construct");
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Balance Response Parsing
 // -----------------------------------------------------------------------------

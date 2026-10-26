@@ -3,6 +3,9 @@
 
 //! Deserialized YAML configuration types for the external metering filter.
 
+#[cfg(feature = "metering-kafka")]
+use std::path::Path;
+
 use praxis_ai_apis::credential_source::CredentialSource;
 use praxis_filter::FilterError;
 use serde::Deserialize;
@@ -23,6 +26,10 @@ const DEFAULT_IDENTITY_HEADER_PREFIX: &str = "x-tenant-";
 /// captured identity headers under.
 const DEFAULT_IDENTITY_METADATA_NAMESPACE: &str = "identity";
 
+/// Only SASL mechanism accepted for the Kafka usage-event transport.
+#[cfg(feature = "metering-kafka")]
+pub(super) const KAFKA_SASL_SCRAM_SHA_512: &str = "SCRAM-SHA-512";
+
 /// Deserialized YAML config for the `external_metering` filter.
 ///
 /// ```yaml
@@ -38,6 +45,22 @@ const DEFAULT_IDENTITY_METADATA_NAMESPACE: &str = "identity";
 /// identity_metadata_namespace: "identity"
 /// default_username: "anonymous"
 /// default_model: "unknown"
+/// ```
+///
+/// Optional Kafka transport for usage and error `CloudEvents`.
+///
+/// ```yaml
+/// kafka:
+///   brokers: ["kafka:9093"]
+///   topic: metering.usage.events
+///   tls:
+///     enabled: true
+///     ca_file: /etc/ssl/kafka/ca.pem
+///   sasl:
+///     mechanism: SCRAM-SHA-512
+///     username: metering-producer
+///     password:
+///       file: /run/secrets/kafka-sasl-password
 /// ```
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -104,6 +127,78 @@ pub(super) struct ExternalMeteringConfig {
     /// unauthenticated (unchanged behavior).
     #[serde(default)]
     pub internal_auth_token: Option<CredentialSource>,
+
+    /// Optional Kafka transport for usage and error `CloudEvents`.
+    /// When absent, events are via POST `{metering_url}/api/v1/events`.
+    /// When present, events are produced to Kafka instead.
+    /// Balance checks always use `metering_url` via HTTP.
+    #[serde(default)]
+    pub kafka: Option<KafkaConfig>,
+}
+
+/// Kafka producer settings for usage-event delivery.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(
+    not(feature = "metering-kafka"),
+    expect(
+        dead_code,
+        reason = "deserialized for a clear feature-gate error when metering-kafka is off"
+    )
+)]
+pub(super) struct KafkaConfig {
+    /// Bootstrap broker list (host:port entries).
+    pub brokers: Vec<String>,
+
+    /// Topic that receives `CloudEvent` JSON payloads.
+    pub topic: String,
+
+    /// TLS configuration.
+    pub tls: KafkaTlsConfig,
+
+    /// SASL authentication.
+    /// Defaults to SASL when TLS is disabled.
+    pub sasl: KafkaSaslConfig,
+}
+
+/// TLS options for the Kafka producer.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(
+    not(feature = "metering-kafka"),
+    expect(
+        dead_code,
+        reason = "deserialized for a clear feature-gate error when metering-kafka is off"
+    )
+)]
+pub(super) struct KafkaTlsConfig {
+    /// Whether to use TLS for the brokers.
+    pub enabled: bool,
+
+    /// PEM CA bundle used for broker certificate verification.
+    #[serde(default)]
+    pub ca_file: Option<String>,
+}
+
+/// SASL options for the Kafka producer.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(
+    not(feature = "metering-kafka"),
+    expect(
+        dead_code,
+        reason = "deserialized for a clear feature-gate error when metering-kafka is off"
+    )
+)]
+pub(super) struct KafkaSaslConfig {
+    /// SASL mechanism. Must be `SCRAM-SHA-512`.
+    pub mechanism: String,
+
+    /// SASL username.
+    pub username: String,
+
+    /// SASL password. Must be file-backed [`CredentialSource`] (`file:` only).
+    pub password: CredentialSource,
 }
 
 /// Validate config at construction time.
@@ -133,7 +228,104 @@ pub(super) fn validate_config(cfg: &ExternalMeteringConfig) -> Result<(), Filter
         return Err("external_metering: identity_metadata_namespace must not be empty".into());
     }
 
+    validate_optional_kafka(cfg.kafka.as_ref())
+}
+
+/// Reject or fully validate an optional `kafka:` block.
+fn validate_optional_kafka(kafka: Option<&KafkaConfig>) -> Result<(), FilterError> {
+    match kafka {
+        None => Ok(()),
+        Some(kafka) => {
+            #[cfg(not(feature = "metering-kafka"))]
+            {
+                let _ = kafka;
+                Err("external_metering: kafka transport requires rebuilding with `--features metering-kafka`".into())
+            }
+            #[cfg(feature = "metering-kafka")]
+            {
+                validate_kafka_config(kafka)
+            }
+        },
+    }
+}
+
+/// Validate the optional Kafka config.
+#[cfg(feature = "metering-kafka")]
+fn validate_kafka_config(kafka: &KafkaConfig) -> Result<(), FilterError> {
+    validate_kafka_brokers(&kafka.brokers)?;
+
+    if kafka.topic.trim().is_empty() {
+        return Err("external_metering: kafka.topic must not be empty".into());
+    }
+
+    if kafka.tls.enabled {
+        let Some(ca_file) = kafka.tls.ca_file.as_deref() else {
+            return Err("external_metering: kafka.tls.ca_file is required when tls.enabled is true".into());
+        };
+        if ca_file.trim().is_empty() {
+            return Err("external_metering: kafka.tls.ca_file must not be empty".into());
+        }
+        if !Path::new(ca_file).is_file() {
+            return Err(format!("external_metering: kafka.tls.ca_file '{ca_file}' is not a readable file").into());
+        }
+    }
+
+    if kafka.sasl.mechanism != KAFKA_SASL_SCRAM_SHA_512 {
+        return Err(format!("external_metering: kafka.sasl.mechanism must be {KAFKA_SASL_SCRAM_SHA_512}").into());
+    }
+
+    if kafka.sasl.username.trim().is_empty() {
+        return Err("external_metering: kafka.sasl.username must not be empty".into());
+    }
+
+    match &kafka.sasl.password {
+        CredentialSource::File(path) => {
+            if path.trim().is_empty() {
+                return Err("external_metering: kafka.sasl.password file path must not be empty".into());
+            }
+            if !Path::new(path).is_file() {
+                return Err(
+                    format!("external_metering: kafka.sasl.password file '{path}' is not a readable file").into(),
+                );
+            }
+        },
+        CredentialSource::Value(_) | CredentialSource::EnvVar(_) => {
+            return Err(
+                "external_metering: kafka.sasl.password must use file: (inline value and env_var are not allowed)"
+                    .into(),
+            );
+        },
+    }
+
     Ok(())
+}
+
+/// Reject an empty broker list or any blank broker entry.
+#[cfg(feature = "metering-kafka")]
+pub(super) fn validate_kafka_brokers(brokers: &[String]) -> Result<(), FilterError> {
+    if brokers.is_empty() {
+        return Err("external_metering: kafka.brokers must not be empty".into());
+    }
+    for broker in brokers {
+        if broker.trim().is_empty() {
+            return Err("external_metering: kafka.brokers entries must not be empty".into());
+        }
+    }
+
+    Ok(())
+}
+
+/// Map `tls.enabled` to librdkafka `security.protocol` (`SASL_SSL` or
+/// `SASL_PLAINTEXT`).
+#[cfg(feature = "metering-kafka")]
+pub(super) fn kafka_security_protocol(tls_enabled: bool) -> &'static str {
+    if tls_enabled { "SASL_SSL" } else { "SASL_PLAINTEXT" }
+}
+
+/// Join broker addresses into the librdkafka `bootstrap.servers` list.
+#[cfg(feature = "metering-kafka")]
+pub(super) fn join_kafka_brokers(brokers: &[String]) -> String {
+    brokers.join(",")
 }
 
 /// Serde default for `timeout_seconds`.
