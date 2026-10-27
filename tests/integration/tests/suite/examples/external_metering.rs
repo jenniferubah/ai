@@ -38,6 +38,72 @@ fn external_metering_kafka_config_parses() {
     assert_eq!(config.listeners.len(), 1, "should have 1 listener");
 }
 
+#[cfg(feature = "metering-kafka")]
+#[test]
+fn external_metering_kafka_balance_check_still_http() {
+    use std::io::Write;
+
+    let backend_guard = start_header_echo_backend();
+    let backend_port = backend_guard.port();
+    let proxy_port = free_port();
+
+    // Balance only: Kafka carries usage events, so the metering mock never
+    // sees POST /api/v1/events.
+    let metering = StatefulCapturingBackend::new(vec![(200, r#"{"hasAccess": true, "balance": 9000.0}"#.to_owned())])
+        .start_with_shutdown();
+    let metering_port = metering.port();
+
+    let password_dir = tempfile::tempdir().expect("temp dir for kafka password");
+    let password_path = password_dir.path().join("kafka-sasl-password");
+    std::fs::File::create(&password_path)
+        .and_then(|mut file| file.write_all(b"test-password"))
+        .expect("write kafka password to file");
+
+    let path = praxis_test_utils::example_config_path("external-metering-kafka.yaml");
+    let yaml = std::fs::read_to_string(&path).expect("read kafka example config");
+    // fail_open:false so a failed balance check cannot yield 200.
+    let patched = praxis_test_utils::patch_yaml(
+        &yaml,
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3000", backend_port), ("127.0.0.1:9090", metering_port)]),
+    )
+    .replace(
+        "/run/secrets/kafka-sasl-password",
+        password_path.to_str().expect("password path is utf-8"),
+    )
+    .replace("fail_open: true", "fail_open: false");
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("parse kafka example");
+
+    let proxy = praxis_test_utils::start_proxy(&config);
+    let raw = http_send(
+        proxy.addr(),
+        "POST /v1/chat/completions HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         x-tenant-username: alice\r\n\
+         x-tenant-group: engineering\r\n\
+         Connection: close\r\n\r\n",
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "kafka transport must still allow requests after a successful HTTP balance check"
+    );
+
+    let balance = metering
+        .requests()
+        .into_iter()
+        .find(|r| r.method == "GET")
+        .expect("the HTTP balance check should reach the metering service");
+    assert!(
+        balance
+            .uri
+            .starts_with("/api/v1/customers/alice/entitlements/inference-tokens/value"),
+        "balance check must use the customer entitlement path: {}",
+        balance.uri
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Balance Check — Access Granted
 // -----------------------------------------------------------------------------

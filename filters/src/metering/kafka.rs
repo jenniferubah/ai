@@ -18,7 +18,7 @@ use zeroize::Zeroizing;
 
 use super::{
     METRIC_REPORT_FAILURES,
-    config::{KafkaConfig, join_kafka_brokers, kafka_security_protocol},
+    config::{KafkaConfig, KafkaSaslMechanism, join_kafka_brokers, kafka_security_protocol},
 };
 
 /// Bounded wait when flushing the producer during filter teardown.
@@ -28,8 +28,6 @@ const KAFKA_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) struct KafkaUsageEventSink {
     /// Idempotent `rdkafka` producer shared across fire-and-forget tasks.
     producer: FutureProducer,
-    /// Bound on waiting for produce acknowledgement.
-    timeout: Duration,
     /// Topic that receives `CloudEvent` JSON payloads.
     topic: String,
 }
@@ -44,14 +42,22 @@ impl KafkaUsageEventSink {
         let password = read_sasl_password(&cfg.sasl.password)?;
         let brokers = join_kafka_brokers(&cfg.brokers);
         let security_protocol = kafka_security_protocol(cfg.tls.enabled);
+        let message_timeout_ms = u64::try_from(timeout.as_millis().max(1))
+            .unwrap_or(u64::MAX)
+            .to_string();
+
+        let mechanism = match cfg.sasl.mechanism {
+            KafkaSaslMechanism::ScramSha512 => "SCRAM-SHA-512",
+        };
 
         let mut client = ClientConfig::new();
         client
             .set("bootstrap.servers", &brokers)
             .set("acks", "all")
             .set("enable.idempotence", "true")
+            .set("message.timeout.ms", &message_timeout_ms)
             .set("security.protocol", security_protocol)
-            .set("sasl.mechanisms", &cfg.sasl.mechanism)
+            .set("sasl.mechanisms", mechanism)
             .set("sasl.username", &cfg.sasl.username)
             .set("sasl.password", password.as_str());
 
@@ -70,21 +76,25 @@ impl KafkaUsageEventSink {
 
         Ok(Self {
             producer,
-            timeout,
             topic: cfg.topic.clone(),
         })
     }
 
-    /// Spawn a fire-and-forget produce of `body`, keyed by the `CloudEvents` `id`.
+    /// Enqueue event immediately, then spawn a task to await delivery.
     pub(super) fn deliver(&self, body: Vec<u8>, event_id: String) {
-        let producer = self.producer.clone();
-        let topic = self.topic.clone();
-        let timeout = self.timeout;
+        let record = FutureRecord::to(&self.topic).payload(&body).key(&event_id);
+        let delivery = match self.producer.send_result(record) {
+            Ok(delivery) => delivery,
+            Err((error, _)) => {
+                counter!(METRIC_REPORT_FAILURES).increment(1);
+                warn!(%error, event_id = %event_id, "metering Kafka usage report enqueue failed");
+                return;
+            },
+        };
 
         tokio::spawn(async move {
-            let record = FutureRecord::to(&topic).payload(&body).key(&event_id);
-            match producer.send(record, timeout).await {
-                Ok(delivery) => {
+            match delivery.await {
+                Ok(Ok(delivery)) => {
                     trace!(
                         partition = delivery.partition,
                         offset = delivery.offset,
@@ -92,9 +102,16 @@ impl KafkaUsageEventSink {
                         "metering usage report produced to Kafka"
                     );
                 },
-                Err((error, _)) => {
+                Ok(Err((error, _))) => {
                     counter!(METRIC_REPORT_FAILURES).increment(1);
                     warn!(%error, event_id = %event_id, "metering Kafka usage report failed");
+                },
+                Err(_) => {
+                    counter!(METRIC_REPORT_FAILURES).increment(1);
+                    warn!(
+                        event_id = %event_id,
+                        "metering Kafka usage report canceled before delivery status"
+                    );
                 },
             }
         });
@@ -103,7 +120,15 @@ impl KafkaUsageEventSink {
 
 impl Drop for KafkaUsageEventSink {
     fn drop(&mut self) {
-        if let Err(error) = self.producer.flush(Timeout::After(KAFKA_FLUSH_TIMEOUT)) {
+        let producer = self.producer.clone();
+        let flush = || producer.flush(Timeout::After(KAFKA_FLUSH_TIMEOUT));
+        let result = match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(flush)
+            },
+            _ => flush(),
+        };
+        if let Err(error) = result {
             warn!(%error, "metering Kafka producer flush on teardown failed");
         }
     }

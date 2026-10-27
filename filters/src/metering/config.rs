@@ -26,9 +26,16 @@ const DEFAULT_IDENTITY_HEADER_PREFIX: &str = "x-tenant-";
 /// captured identity headers under.
 const DEFAULT_IDENTITY_METADATA_NAMESPACE: &str = "identity";
 
-/// Only SASL mechanism accepted for the Kafka usage-event transport.
-#[cfg(feature = "metering-kafka")]
-pub(super) const KAFKA_SASL_SCRAM_SHA_512: &str = "SCRAM-SHA-512";
+/// SASL mechanisms accepted for the Kafka usage-event transport.
+///
+/// Kept for YAML deserialization when `metering-kafka` is off so operators
+/// get a clear feature-gate error instead of an unknown-field reject.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub(super) enum KafkaSaslMechanism {
+    /// SCRAM-SHA-512 (the only mechanism accepted by this filter).
+    #[serde(rename = "SCRAM-SHA-512")]
+    ScramSha512,
+}
 
 /// Deserialized YAML config for the `external_metering` filter.
 ///
@@ -129,7 +136,7 @@ pub(super) struct ExternalMeteringConfig {
     pub internal_auth_token: Option<CredentialSource>,
 
     /// Optional Kafka transport for usage and error `CloudEvents`.
-    /// When absent, events are via POST `{metering_url}/api/v1/events`.
+    /// When absent, events are sent via POST `{metering_url}/api/v1/events`.
     /// When present, events are produced to Kafka instead.
     /// Balance checks always use `metering_url` via HTTP.
     #[serde(default)]
@@ -176,6 +183,7 @@ pub(super) struct KafkaTlsConfig {
     pub enabled: bool,
 
     /// PEM CA bundle used for broker certificate verification.
+    /// Required when `tls.enabled` is `true` and ignored when TLS is off.
     #[serde(default)]
     pub ca_file: Option<String>,
 }
@@ -192,7 +200,7 @@ pub(super) struct KafkaTlsConfig {
 )]
 pub(super) struct KafkaSaslConfig {
     /// SASL mechanism. Must be `SCRAM-SHA-512`.
-    pub mechanism: String,
+    pub mechanism: KafkaSaslMechanism,
 
     /// SASL username.
     pub username: String,
@@ -268,10 +276,6 @@ fn validate_kafka_config(kafka: &KafkaConfig) -> Result<(), FilterError> {
         if !Path::new(ca_file).is_file() {
             return Err(format!("external_metering: kafka.tls.ca_file '{ca_file}' is not a readable file").into());
         }
-    }
-
-    if kafka.sasl.mechanism != KAFKA_SASL_SCRAM_SHA_512 {
-        return Err(format!("external_metering: kafka.sasl.mechanism must be {KAFKA_SASL_SCRAM_SHA_512}").into());
     }
 
     if kafka.sasl.username.trim().is_empty() {

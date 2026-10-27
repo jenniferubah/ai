@@ -153,6 +153,10 @@ const STATUS_METERING_UNAVAILABLE: u16 = 503;
 /// Event delivery is fire-and-forget on either transport so broker or HTTP
 /// sink unavailability never adds request latency (at-most-once until #1637).
 ///
+/// Kafka reads `kafka.sasl.password` only when the filter is constructed.
+/// After the password file changes, reload the filter so the producer is
+/// recreated.
+///
 /// # YAML
 ///
 /// ```yaml
@@ -402,7 +406,7 @@ impl ExternalMeteringFilter {
         let request_id = ctx.id_generator.generate(ctx.time_source);
         let event_ctx = EventContext {
             duration_ms: u64::try_from(state.request_start.elapsed().as_millis()).unwrap_or(u64::MAX),
-            event_id: &request_id,
+            event_id: request_id.as_str(),
             provider: self.resolve_provider(ctx),
             source: &self.source,
             state: &state,
@@ -414,7 +418,6 @@ impl ExternalMeteringFilter {
             build_usage_event(&event_ctx, &TokenCounts::read(ctx))
         };
 
-        // Resolve the callout credential on the filter (not in the spawned
         let body = match serde_json::to_vec(&event) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -423,17 +426,25 @@ impl ExternalMeteringFilter {
             },
         };
 
-        // Only HTTP authenticates with the internal token.
-        let http_headers = match &self.event_sink {
-            UsageEventSink::Http(_) => report_callout_headers(self.auth_header()),
+        self.deliver_report(
+            body,
             #[cfg(feature = "metering-kafka")]
-            UsageEventSink::Kafka(_) => Some(http::HeaderMap::new()),
-        };
-        let Some(http_headers) = http_headers else {
-            return;
-        };
+            &request_id,
+        );
+    }
 
-        self.event_sink.deliver(body, request_id, Some(http_headers));
+    /// Hand the serialized event to the configured broker.
+    fn deliver_report(&self, body: Vec<u8>, #[cfg(feature = "metering-kafka")] request_id: &str) {
+        match &self.event_sink {
+            UsageEventSink::Http(sink) => {
+                let Some(headers) = report_callout_headers(self.auth_header()) else {
+                    return;
+                };
+                sink.deliver(body, headers);
+            },
+            #[cfg(feature = "metering-kafka")]
+            UsageEventSink::Kafka(sink) => sink.deliver(body, request_id.to_owned()),
+        }
     }
 }
 

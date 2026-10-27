@@ -29,28 +29,6 @@ pub(super) enum UsageEventSink {
     Kafka(KafkaUsageEventSink),
 }
 
-impl UsageEventSink {
-    /// Deliver a serialized `CloudEvent` without blocking the response path.
-    ///
-    /// `http_headers` is required for the HTTP sink (may be empty when
-    /// unauthenticated) and ignored for Kafka.
-    pub(super) fn deliver(&self, body: Vec<u8>, event_id: String, http_headers: Option<http::HeaderMap>) {
-        match self {
-            Self::Http(sink) => {
-                drop(event_id);
-                let Some(headers) = http_headers else {
-                    warn!("HTTP usage report missing callout headers; dropping event");
-                    counter!(METRIC_REPORT_FAILURES).increment(1);
-                    return;
-                };
-                sink.deliver(body, headers);
-            },
-            #[cfg(feature = "metering-kafka")]
-            Self::Kafka(sink) => sink.deliver(body, event_id),
-        }
-    }
-}
-
 /// HTTP POST transport for metering `CloudEvents`.
 pub(super) struct HttpUsageEventSink {
     /// Connect-time policy for the metering events URL.
@@ -81,7 +59,7 @@ impl HttpUsageEventSink {
     }
 
     /// Spawn a fire-and-forget HTTP POST of `body`.
-    fn deliver(&self, body: Vec<u8>, mut headers: http::HeaderMap) {
+    pub(super) fn deliver(&self, body: Vec<u8>, mut headers: http::HeaderMap) {
         headers.insert(
             http::header::CONTENT_TYPE,
             http::HeaderValue::from_static("application/json"),

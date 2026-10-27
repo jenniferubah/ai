@@ -378,9 +378,7 @@ mod kafka_config {
     use std::io::Write;
 
     use super::*;
-    use crate::metering::config::{
-        KAFKA_SASL_SCRAM_SHA_512, join_kafka_brokers, kafka_security_protocol, validate_kafka_brokers,
-    };
+    use crate::metering::config::{join_kafka_brokers, kafka_security_protocol, validate_kafka_brokers};
 
     fn kafka_yaml(password_file: &str) -> serde_yaml::Value {
         serde_yaml::from_str(&format!(
@@ -423,11 +421,6 @@ kafka:
             join_kafka_brokers(&[String::from("a:1"), String::from("b:2")]),
             "a:1,b:2"
         );
-    }
-
-    #[test]
-    fn scram_constant_is_stable() {
-        assert_eq!(KAFKA_SASL_SCRAM_SHA_512, "SCRAM-SHA-512");
     }
 
     #[test]
@@ -543,11 +536,10 @@ kafka:
     fn accepts_tls_with_ca_file() {
         let dir = tempfile::tempdir().unwrap();
         let password = write_temp_file(&dir, "password", b"secret");
-        let ca = write_temp_file(
-            &dir,
-            "ca.pem",
-            b"-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n",
-        );
+        let ca_key = rcgen::KeyPair::generate().expect("generate test CA key");
+        let ca_params = rcgen::CertificateParams::new(vec!["localhost".to_owned()]).expect("CA params");
+        let ca_cert = ca_params.self_signed(&ca_key).expect("self-sign test CA");
+        let ca = write_temp_file(&dir, "ca.pem", ca_cert.pem().as_bytes());
         let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
             r#"
 metering_url: "http://metering:8080"

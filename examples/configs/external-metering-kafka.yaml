@@ -7,8 +7,10 @@
 #   cargo run -p praxis-ai-proxy --features metering-kafka -- \
 #     -c examples/configs/external-metering-kafka.yaml
 #
-# Replace the kafka.brokers, TLS CA path, and SASL password file with values
-# from your environment. The password must be a file (not an inline secret).
+# Loopback / local testing only: tls.enabled is false (plaintext SASL).
+# Usage events can carry tenant fields (organization_id, cost_center, etc.).
+# For a remote broker, set tls.enabled: true and tls.ca_file to a PEM CA
+# bundle, and point password.file at a file-backed SASL secret (not inline).
 
 listeners:
   - name: default
