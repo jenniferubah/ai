@@ -27,7 +27,7 @@ const KAFKA_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Fire-and-forget Kafka producer for metering `CloudEvents`.
 pub(super) struct KafkaUsageEventSink {
     /// Idempotent `rdkafka` producer shared across fire-and-forget tasks.
-    producer: FutureProducer,
+    producer: Option<FutureProducer>,
     /// Topic that receives `CloudEvent` JSON payloads.
     topic: String,
 }
@@ -75,7 +75,7 @@ impl KafkaUsageEventSink {
         })?;
 
         Ok(Self {
-            producer,
+            producer: Some(producer),
             topic: cfg.topic.clone(),
         })
     }
@@ -83,7 +83,10 @@ impl KafkaUsageEventSink {
     /// Enqueue event immediately, then spawn a task to await delivery.
     pub(super) fn deliver(&self, body: Vec<u8>, event_id: String) {
         let record = FutureRecord::to(&self.topic).payload(&body).key(&event_id);
-        let delivery = match self.producer.send_result(record) {
+        let Some(producer) = self.producer.as_ref() else {
+            return;
+        };
+        let delivery = match producer.send_result(record) {
             Ok(delivery) => delivery,
             Err((error, _)) => {
                 counter!(METRIC_REPORT_FAILURES).increment(1);
@@ -120,17 +123,27 @@ impl KafkaUsageEventSink {
 
 impl Drop for KafkaUsageEventSink {
     fn drop(&mut self) {
-        let producer = self.producer.clone();
-        let flush = || producer.flush(Timeout::After(KAFKA_FLUSH_TIMEOUT));
-        let result = match tokio::runtime::Handle::try_current() {
-            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(flush)
-            },
-            _ => flush(),
+        let Some(producer) = self.producer.take() else {
+            return;
         };
-        if let Err(error) = result {
-            warn!(%error, "metering Kafka producer flush on teardown failed");
-        }
+        let teardown = move || {
+            if let Err(error) = producer.flush(Timeout::After(KAFKA_FLUSH_TIMEOUT)) {
+                warn!(%error, "metering Kafka producer flush on teardown failed");
+            }
+            // `FutureProducer` owns a polling thread and joins it on drop, so
+            // destroy it on the same blocking worker as the flush.
+            drop(producer);
+        };
+
+        // Do not queue this on Tokio's blocking pool: the runtime may already
+        // be shutting down, in which case queued blocking work is never run.
+        // Moving ownership also keeps the final producer's polling-thread join
+        // off the service worker that drops this sink.
+        drop(
+            std::thread::Builder::new()
+                .name("metering-kafka-teardown".to_owned())
+                .spawn(teardown),
+        );
     }
 }
 

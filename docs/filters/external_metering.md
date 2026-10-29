@@ -23,7 +23,7 @@ Optional Kafka transport for usage and error `CloudEvents`.
 |-------|------|---------|-------------|
 | `metering_url` | string | yes | Base URL of the external metering service (required). |
 | `allow_private_endpoint` | bool | no | Allow the metering endpoint to resolve to non-public addresses (loopback, private, link-local). Defaults to `false`, so callouts are rejected before connecting unless the operator opts in. Cloud metadata, unspecified, and multicast addresses remain blocked. |
-| `timeout_seconds` | integer | no | HTTP timeout in seconds for all metering calls. |
+| `timeout_seconds` | integer | no | Timeout in seconds for metering HTTP calls and Kafka event delivery. |
 | `feature_key` | string | no | Entitlement feature key used in balance check URL path. |
 | `source` | string | no | `CloudEvents` `source` field value. |
 | `provider` | string | no | Static provider name attributed to emitted `CloudEvents`. |
@@ -39,7 +39,7 @@ Optional Kafka transport for usage and error `CloudEvents`.
 | `kafka.tls` | object | yes | TLS configuration. |
 | `kafka.tls.enabled` | bool | yes | Whether to use TLS for the brokers. |
 | `kafka.tls.ca_file` | string | no | PEM CA bundle used for broker certificate verification. Required when `tls.enabled` is `true` and ignored when TLS is off. |
-| `kafka.sasl` | object | yes | SASL authentication. Defaults to SASL when TLS is disabled. |
+| `kafka.sasl` | object | yes | Required SASL authentication. TLS selects `SASL_SSL` or `SASL_PLAINTEXT` for the connection. |
 | `kafka.sasl.mechanism` | `SCRAM-SHA-512` | yes | SASL mechanism. Must be `SCRAM-SHA-512`. |
 | `kafka.sasl.username` | string | yes | SASL username. |
 | `kafka.sasl.password` | CredentialSource | yes | SASL password. Must be file-backed [`CredentialSource`] (`file:` only). |

@@ -10,7 +10,7 @@ use praxis_ai_apis::credential_source::CredentialSource;
 use praxis_filter::FilterError;
 use serde::Deserialize;
 
-/// Default HTTP timeout for metering service calls (5 seconds).
+/// Default timeout for metering calls and Kafka event delivery (5 seconds).
 const DEFAULT_TIMEOUT_SECONDS: u64 = 5;
 
 /// Default entitlement feature key for balance checks.
@@ -25,6 +25,10 @@ const DEFAULT_IDENTITY_HEADER_PREFIX: &str = "x-tenant-";
 /// Default metadata namespace the `identity_header_guard` filter writes
 /// captured identity headers under.
 const DEFAULT_IDENTITY_METADATA_NAMESPACE: &str = "identity";
+
+/// Kafka brokers accept topic names up to 249 UTF-8 bytes.
+#[cfg(feature = "metering-kafka")]
+const MAX_KAFKA_TOPIC_NAME_BYTES: usize = 249;
 
 /// SASL mechanisms accepted for the Kafka usage-event transport.
 ///
@@ -82,7 +86,7 @@ pub(super) struct ExternalMeteringConfig {
     #[serde(default)]
     pub allow_private_endpoint: bool,
 
-    /// HTTP timeout in seconds for all metering calls.
+    /// Timeout in seconds for metering HTTP calls and Kafka event delivery.
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
 
@@ -163,8 +167,8 @@ pub(super) struct KafkaConfig {
     /// TLS configuration.
     pub tls: KafkaTlsConfig,
 
-    /// SASL authentication.
-    /// Defaults to SASL when TLS is disabled.
+    /// Required SASL authentication. TLS selects `SASL_SSL` or
+    /// `SASL_PLAINTEXT` for the connection.
     pub sasl: KafkaSaslConfig,
 }
 
@@ -266,6 +270,24 @@ fn validate_kafka_config(kafka: &KafkaConfig) -> Result<(), FilterError> {
         return Err("external_metering: kafka.topic must not be empty".into());
     }
 
+    if kafka.topic.len() > MAX_KAFKA_TOPIC_NAME_BYTES {
+        return Err(
+            format!("external_metering: kafka.topic must be at most {MAX_KAFKA_TOPIC_NAME_BYTES} bytes").into(),
+        );
+    }
+
+    if kafka.topic == "."
+        || kafka.topic == ".."
+        || !kafka
+            .topic
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(
+            "external_metering: kafka.topic may contain only ASCII letters, numbers, '.', '_' or '-', and must not be '.' or '..'".into(),
+        );
+    }
+
     if kafka.tls.enabled {
         let Some(ca_file) = kafka.tls.ca_file.as_deref() else {
             return Err("external_metering: kafka.tls.ca_file is required when tls.enabled is true".into());
@@ -304,15 +326,58 @@ fn validate_kafka_config(kafka: &KafkaConfig) -> Result<(), FilterError> {
     Ok(())
 }
 
-/// Reject an empty broker list or any blank broker entry.
+/// Reject an empty broker list or malformed host[:port] entries.
 #[cfg(feature = "metering-kafka")]
 pub(super) fn validate_kafka_brokers(brokers: &[String]) -> Result<(), FilterError> {
     if brokers.is_empty() {
         return Err("external_metering: kafka.brokers must not be empty".into());
     }
     for broker in brokers {
-        if broker.trim().is_empty() {
-            return Err("external_metering: kafka.brokers entries must not be empty".into());
+        let invalid = || {
+            FilterError::from(format!(
+                "external_metering: kafka.brokers entry '{broker}' must be a host[:port] address with a valid port (bracket IPv6 literals)"
+            ))
+        };
+        if broker.trim().is_empty()
+            || broker.trim() != broker
+            || broker.contains([' ', '\t', '\r', '\n', ',', '/', '@'])
+            || broker.contains("://")
+        {
+            return Err(invalid());
+        }
+
+        let authority = broker.parse::<http::uri::Authority>().map_err(|_| invalid())?;
+        if authority.host().is_empty() {
+            return Err(invalid());
+        }
+
+        // `Authority::port()` returns `None` for malformed ports as well as
+        // absent ports, so inspect the configured suffix before accepting it.
+        let port = if broker.starts_with('[') {
+            let Some(host_end) = broker.find(']') else {
+                return Err(invalid());
+            };
+            let suffix = &broker[host_end + 1..];
+            if suffix.is_empty() {
+                None
+            } else {
+                Some(suffix.strip_prefix(':').ok_or_else(|| invalid())?)
+            }
+        } else if let Some((host, port)) = broker.rsplit_once(':') {
+            if host.contains(':') {
+                return Err(invalid());
+            }
+            Some(port)
+        } else {
+            None
+        };
+        if let Some(port) = port {
+            let Ok(port) = port.parse::<u16>() else {
+                return Err(invalid());
+            };
+            if port == 0 {
+                return Err(invalid());
+            }
         }
     }
 

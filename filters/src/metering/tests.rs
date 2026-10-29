@@ -9,6 +9,15 @@ fn build_filter(yaml: &serde_yaml::Value) -> Result<ExternalMeteringFilter, Filt
     ExternalMeteringFilter::build(yaml, crate::isolated_subrequest_client(1))
 }
 
+/// Extract a configuration error without requiring the success type to
+/// implement `Debug`.
+fn config_error(yaml: &serde_yaml::Value) -> FilterError {
+    match ExternalMeteringFilter::from_config(yaml) {
+        Err(error) => error,
+        Ok(_) => panic!("invalid external_metering config unexpectedly succeeded"),
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Config Parsing
 // -----------------------------------------------------------------------------
@@ -417,10 +426,30 @@ kafka:
         assert!(validate_kafka_brokers(&[]).is_err());
         assert!(validate_kafka_brokers(&[String::new()]).is_err());
         assert!(validate_kafka_brokers(&[String::from("kafka:9093")]).is_ok());
+        assert!(validate_kafka_brokers(&[String::from("broker.example")]).is_ok());
+        assert!(validate_kafka_brokers(&[String::from("[::1]:9093")]).is_ok());
+        assert!(validate_kafka_brokers(&[String::from("[::1]")]).is_ok());
+        assert!(validate_kafka_brokers(&[String::from("kafka:65535")]).is_ok());
         assert_eq!(
             join_kafka_brokers(&[String::from("a:1"), String::from("b:2")]),
             "a:1,b:2"
         );
+    }
+
+    #[test]
+    fn rejects_malformed_broker_addresses() {
+        for broker in [
+            "https://127.0.0.1:9093",
+            "127.0.0.1:notaport",
+            "127.0.0.1:65536",
+            "127.0.0.1:0",
+            "127.0.0.1:9093,127.0.0.1:9094",
+            " broker:9093",
+        ] {
+            let error = validate_kafka_brokers(&[broker.to_owned()])
+                .expect_err(&format!("malformed broker address {broker:?} must fail at startup"));
+            assert!(error.to_string().contains("kafka.brokers"), "{error}");
+        }
     }
 
     #[test]
@@ -429,6 +458,105 @@ kafka:
         let password = write_temp_file(&dir, "password", b"secret");
         let yaml = kafka_yaml(&password);
         ExternalMeteringFilter::from_config(&yaml).expect("valid kafka config must construct");
+    }
+
+    #[test]
+    fn accepts_topic_at_the_kafka_name_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let password = write_temp_file(&dir, "password", b"secret");
+        let mut yaml = kafka_yaml(&password);
+        yaml["kafka"]["topic"] = serde_yaml::Value::String("x".repeat(249));
+
+        ExternalMeteringFilter::from_config(&yaml).expect("249-byte Kafka topic names are valid");
+    }
+
+    #[test]
+    fn teardown_does_not_block_a_current_thread_runtime() {
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let password = write_temp_file(&dir, "password", b"secret");
+        let mut yaml = kafka_yaml(&password);
+        yaml["kafka"]["brokers"] =
+            serde_yaml::Value::Sequence(vec![serde_yaml::Value::String("127.0.0.1:1".to_owned())]);
+        yaml["timeout_seconds"] = serde_yaml::Value::Number(30.into());
+        let filter = build_filter(&yaml).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async move {
+            let UsageEventSink::Kafka(sink) = &filter.event_sink else {
+                panic!("Kafka config must construct a Kafka usage sink");
+            };
+            sink.deliver(b"pending record".to_vec(), "teardown-test".to_owned());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            let started = Instant::now();
+            drop(filter);
+            assert!(
+                started.elapsed() < Duration::from_millis(250),
+                "dropping a producer with a pending record must not block its runtime worker"
+            );
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                tokio::time::sleep(Duration::from_millis(10)),
+            )
+            .await
+            .expect("the current-thread runtime must keep polling during producer teardown");
+        });
+    }
+
+    #[test]
+    fn failed_kafka_delivery_increments_the_report_failure_counter() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let password = write_temp_file(&dir, "password", b"secret");
+        let mut yaml = kafka_yaml(&password);
+        yaml["kafka"]["brokers"] =
+            serde_yaml::Value::Sequence(vec![serde_yaml::Value::String("127.0.0.1:1".to_owned())]);
+        yaml["timeout_seconds"] = serde_yaml::Value::Number(1.into());
+        let filter = build_filter(&yaml).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        let failure_recorded = metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async move {
+                let UsageEventSink::Kafka(sink) = &filter.event_sink else {
+                    panic!("Kafka config must construct a Kafka usage sink");
+                };
+                sink.deliver(b"unreachable broker".to_vec(), "failure-test".to_owned());
+
+                let recorded = tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        let failures = snapshotter.snapshot().into_vec().into_iter().any(|(key, _, _, value)| {
+                            key.key().name() == METRIC_REPORT_FAILURES
+                                && matches!(value, metrics_util::debugging::DebugValue::Counter(count) if count > 0)
+                        });
+                        if failures {
+                            break true;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("the unreachable broker should produce a counted delivery failure");
+
+                drop(filter);
+                recorded
+            })
+        });
+
+        assert!(
+            failure_recorded,
+            "Kafka delivery failures must increment the shared report counter"
+        );
     }
 
     #[test]
@@ -451,8 +579,28 @@ kafka:
 "#
         ))
         .unwrap();
-        let err = ExternalMeteringFilter::from_config(&yaml).unwrap_err();
+        let err = config_error(&yaml);
         assert!(err.to_string().contains("kafka.topic"), "{err}");
+    }
+
+    #[test]
+    fn rejects_invalid_or_oversized_topic_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let password = write_temp_file(&dir, "password", b"secret");
+        let oversized_topic = "x".repeat(513);
+        let topic_over_limit = "x".repeat(250);
+        for topic in [
+            ".",
+            "..",
+            "bad topic",
+            topic_over_limit.as_str(),
+            oversized_topic.as_str(),
+        ] {
+            let mut yaml = kafka_yaml(&password);
+            yaml["kafka"]["topic"] = serde_yaml::Value::String(topic.to_owned());
+            let error = config_error(&yaml);
+            assert!(error.to_string().contains("kafka.topic"), "{error}");
+        }
     }
 
     #[test]
@@ -475,7 +623,7 @@ kafka:
 "#
         ))
         .unwrap();
-        let err = ExternalMeteringFilter::from_config(&yaml).unwrap_err();
+        let err = config_error(&yaml);
         assert!(err.to_string().contains("SCRAM-SHA-512"), "{err}");
     }
 
@@ -497,14 +645,14 @@ kafka:
 "#,
         )
         .unwrap();
-        let err = ExternalMeteringFilter::from_config(&yaml).unwrap_err();
+        let err = config_error(&yaml);
         assert!(err.to_string().contains("file:"), "{err}");
     }
 
     #[test]
     fn rejects_missing_password_file() {
         let yaml = kafka_yaml("/nonexistent/kafka-password");
-        let err = ExternalMeteringFilter::from_config(&yaml).unwrap_err();
+        let err = config_error(&yaml);
         assert!(err.to_string().contains("kafka.sasl.password"), "{err}");
     }
 
@@ -528,7 +676,7 @@ kafka:
 "#
         ))
         .unwrap();
-        let err = ExternalMeteringFilter::from_config(&yaml).unwrap_err();
+        let err = config_error(&yaml);
         assert!(err.to_string().contains("kafka.tls.ca_file"), "{err}");
     }
 
